@@ -37,7 +37,7 @@
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/node": "25.9.9",
     "decimal.js-light": "2.5.1",
-    "esbuild": "0.25.12",
+    "esbuild": "0.28.2",
     "tldts": "7.4.18",
     "typescript": "5.9.3",
     "vitest": "4.1.12",
