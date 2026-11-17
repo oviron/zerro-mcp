@@ -112,6 +112,16 @@ describe("write tools", () => {
     expect(fake.pushes()).toHaveLength(0);
   });
 
+  it("keeps the token when ZenMoney reports timestamps a second apart", async () => {
+    const server = new FakeZenMoney();
+    server.jitter = true;
+    const args = { envelope: "Food", amount: 1200, month: "2026-11" };
+    const a = await (await connect({ write: true, server })).call("set_envelope_budget", args);
+    const second = await connect({ write: true, server });
+    const r = await second.call("set_envelope_budget", { ...args, confirm: a.data!.token });
+    expect(r.data).toMatchObject({ status: "confirmed" });
+  });
+
   it("moves funds between envelopes and from To be assigned", async () => {
     const { call, fake } = await connect({ write: true });
     const args = { from: "toBeAssigned", to: "Home", amount: 1, currency: "USD", month: "2026-11" };

@@ -142,7 +142,9 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
       const id = row.id as string | number;
       const existing = (snap.data as unknown as Record<string, Record<string | number, { changed?: number }>>)[table]?.[id];
       if (existing) {
-        versions[`${table}:${id}`] = existing.changed ?? null;
+        // Content, not `changed`: ZenMoney answers the same row with `changed` a second
+        // apart from request to request, so a timestamp is no version.
+        versions[`${table}:${id}`] = contentHash(existing);
         (original[table] ??= []).push(existing);
       } else {
         // New rows get fresh random ids on every compile: count them, not name them.
@@ -256,9 +258,14 @@ export function stableJson(v: unknown): string {
   return JSON.stringify(v) ?? "null";
 }
 
-/** Any added, changed or deleted transaction changes this, and with it the token. */
+/** Any added, edited or deleted transaction changes this, and with it the token. */
 function transactionsDigest(data: TDataStore): string {
   const h = createHash("sha256");
-  for (const t of Object.values(data.transaction).sort((a, b) => (a.id < b.id ? -1 : 1))) h.update(`${t.id}:${t.changed};`);
+  for (const t of Object.values(data.transaction).sort((a, b) => (a.id < b.id ? -1 : 1))) h.update(`${contentHash(t)};`);
   return h.digest("hex");
+}
+
+/** A row's content without its timestamps, which ZenMoney does not report stably. */
+function contentHash(row: unknown): string {
+  return createHash("sha256").update(stableJson(strip(row))).digest("hex").slice(0, 16);
 }

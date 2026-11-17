@@ -1,6 +1,6 @@
 {
   "name": "zerro-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for Zerro envelope budgets on top of ZenMoney, computed by Zerro's own core",
   "type": "module",
   "bin": {

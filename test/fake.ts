@@ -74,6 +74,8 @@ export class FakeZenMoney implements DiffClient {
   requests: DiffRequest[] = [];
   /** Next push: "lost" applies it and loses the answer, "dropped" never applies it, "refused" is a 4xx, "error503" applies it and answers 503. */
   fault?: "lost" | "dropped" | "refused" | "error503";
+  /** Answer every other request with each `changed` a second later, as ZenMoney's API does. */
+  jitter = false;
   /** Runs right after a push is applied, as another client writing meanwhile. */
   afterPush?: () => void;
 
@@ -101,8 +103,11 @@ export class FakeZenMoney implements DiffClient {
     if (fault === "error503") throw new UnknownOutcomeError("ZenMoney API failed (HTTP 503)");
     const since = request.serverTimestamp;
     const out: WireDiff = { serverTimestamp: this.clock };
+    const shift = this.jitter && this.requests.length % 2 === 0 ? 1 : 0;
     for (const [key, map] of this.rows) {
-      const rows = [...map.values()].filter(r => r.stamp > since).map(r => r.row);
+      const rows = [...map.values()]
+        .filter(r => r.stamp > since)
+        .map(r => (shift && typeof r.row.changed === "number" ? { ...r.row, changed: r.row.changed + shift } : r.row));
       if (rows.length) out[key] = rows;
     }
     const dels = this.deletions.filter(d => d.stamp > since).map(d => d.row);
