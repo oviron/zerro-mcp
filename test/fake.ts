@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Config } from "../src/config";
 import { Replica } from "../src/replica";
 import { createServer } from "../src/server";
-import { UnknownOutcomeError, type DiffClient, type DiffRequest } from "../src/zenmoney/client";
+import { UnknownOutcomeError, ZenMoneyError, type DiffClient, type DiffRequest } from "../src/zenmoney/client";
 import type { WireDiff } from "../src/zenmoney/wire";
 
 type Row = Record<string, unknown> & { changed?: number };
@@ -72,8 +72,10 @@ export class FakeZenMoney implements DiffClient {
   deletions: { row: Row; stamp: number }[] = [];
   clock: number;
   requests: DiffRequest[] = [];
-  /** Next push: "lost" applies it and loses the answer, "dropped" never applies it. */
-  fault?: "lost" | "dropped";
+  /** Next push: "lost" applies it and loses the answer, "dropped" never applies it, "refused" is a 4xx, "error503" applies it and answers 503. */
+  fault?: "lost" | "dropped" | "refused" | "error503";
+  /** Runs right after a push is applied, as another client writing meanwhile. */
+  afterPush?: () => void;
 
   constructor(initial: WireDiff = fixture()) {
     this.clock = (initial.serverTimestamp as number) + 100;
@@ -85,15 +87,18 @@ export class FakeZenMoney implements DiffClient {
     this.requests.push(request);
     this.clock += 10;
     const isPush = KEYS.some(k => Array.isArray(request[k])) || Array.isArray(request.deletion);
-    if (isPush && this.fault === "dropped") {
-      this.fault = undefined;
-      throw new UnknownOutcomeError("ZenMoney API request failed: no answer within 60s");
-    }
+    const fault = isPush ? this.fault : undefined;
+    if (isPush) this.fault = undefined;
+    if (fault === "dropped") throw new UnknownOutcomeError("ZenMoney API request failed: no answer within 60s");
+    if (fault === "refused") throw new ZenMoneyError("ZenMoney API refused the request (HTTP 400)", 400);
     if (isPush) this.apply(request, false);
-    if (isPush && this.fault === "lost") {
-      this.fault = undefined;
-      throw new UnknownOutcomeError("ZenMoney API request failed: no answer within 60s");
+    if (isPush && this.afterPush) {
+      const hook = this.afterPush;
+      this.afterPush = undefined;
+      hook();
     }
+    if (fault === "lost") throw new UnknownOutcomeError("ZenMoney API request failed: no answer within 60s");
+    if (fault === "error503") throw new UnknownOutcomeError("ZenMoney API failed (HTTP 503)");
     const since = request.serverTimestamp;
     const out: WireDiff = { serverTimestamp: this.clock };
     for (const [key, map] of this.rows) {
@@ -128,7 +133,8 @@ export class FakeZenMoney implements DiffClient {
       for (const row of rows as Row[]) {
         const id = rowId(key, row);
         const stored = map.get(id);
-        if (stored && (stored.row.changed ?? 0) > (row.changed ?? 0)) continue;
+        // ZenMoney keeps the stored row unless the incoming one is strictly newer.
+        if (!initial && stored && (stored.row.changed ?? 0) >= (row.changed ?? 0)) continue;
         map.set(id, { row: { ...row }, stamp });
       }
     }
@@ -139,9 +145,9 @@ export class FakeZenMoney implements DiffClient {
   }
 }
 
-export async function connect(options: { write?: boolean; server?: FakeZenMoney; now?: () => number } = {}) {
+export async function connect(options: { write?: boolean; server?: FakeZenMoney; now?: () => number; stateDir?: string } = {}) {
   const fake = options.server ?? new FakeZenMoney();
-  const stateDir = mkdtempSync(join(tmpdir(), "zerro-mcp-test-"));
+  const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), "zerro-mcp-test-"));
   const config: Config = {
     token: "test",
     apiBase: "https://api.zenmoney.ru",

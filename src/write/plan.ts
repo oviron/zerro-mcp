@@ -42,6 +42,8 @@ export type Plan = {
   original: Record<string, unknown[]>;
   /** Expected own-assignments for every month after the write. */
   expectedBudgets: Record<string, Record<string, number>>;
+  /** Envelopes and months whose figures the preview shows. */
+  watched: { envelopes: TEnvelopeId[]; months: Month[] };
 };
 
 export class NothingToChange extends Error {}
@@ -115,29 +117,20 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
     const parent = envs[c.id]?.parent;
     if (parent) affected.add(parent);
   }
-  const m0 = before.graph.envMetrics(before.data)[action.month];
-  const m1 = after.graph.envMetrics(after.data)[action.month];
-  const effects: EnvelopeEffect[] = [...affected].map(id => {
-    const c = envs[id].currency;
-    return {
-      id,
-      name: envs[id].name,
-      currency: c,
-      assigned: [before.convert(m0[id].totalAssigned, c, action.month), after.convert(m1[id].totalAssigned, c, action.month)],
-      available: [before.convert(m0[id].totalAvailable, c, action.month), after.convert(m1[id].totalAvailable, c, action.month)],
-    };
-  });
-
-  const cur = before.displayCurrency;
-  const tbaMonths = [...new Set([action.month, before.currentMonth])].filter(m => before.months.includes(m));
-  const t0 = before.graph.monthTotals(before.data);
-  const t1 = after.graph.monthTotals(after.data);
-  const toBeAssigned = tbaMonths.map(month => ({
-    month,
-    currency: cur,
-    before: before.convert(t0[month].toBeAssigned, cur, month),
-    after: after.convert(t1[month].toBeAssigned, cur, month),
+  const watched = {
+    envelopes: [...affected],
+    months: [...new Set([action.month, before.currentMonth])].filter(m => before.months.includes(m)),
+  };
+  const was = measure(before, action.month, watched);
+  const will = measure(after, action.month, watched);
+  const effects: EnvelopeEffect[] = will.envelopes.map((e, i) => ({
+    ...e,
+    assigned: [was.envelopes[i].assigned, e.assigned],
+    available: [was.envelopes[i].available, e.available],
   }));
+  const toBeAssigned = will.toBeAssigned.map((t, i) => ({ ...t, before: was.toBeAssigned[i].value, after: t.value })).map(
+    ({ value: _v, ...t }) => t,
+  );
 
   const original: Record<string, unknown[]> = {};
   const versions: Record<string, unknown> = {};
@@ -158,12 +151,18 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
     }
   }
 
+  // Everything the write depends on and produces, minus send times and the
+  // random ids of rows it creates: equal state gives an equal token.
+  const rates = {
+    month: before.graph.fxRatesGetter(before.data)(action.month).rates,
+    current: before.graph.currentFxRates(before.data).rates,
+  };
   const token = createHash("sha256")
-    .update(JSON.stringify({ action, changes, effects, toBeAssigned, versions }))
+    .update(stableJson({ action, changes, effects, toBeAssigned, versions, rates, expected: b1, sent: canonicalTransport(transport, snap.data) }))
     .digest("hex")
     .slice(0, 16);
 
-  return { action, token, changes, effects, toBeAssigned, transport, original, expectedBudgets: b1 };
+  return { action, token, changes, effects, toBeAssigned, transport, original, expectedBudgets: b1, watched };
 }
 
 export function describePlan(plan: Plan): string {
@@ -193,4 +192,63 @@ export function requireAmount(amount: number, positive: boolean) {
   if (!Number.isFinite(amount)) throw new ToolInputError("Amount must be a finite number");
   if (positive && amount <= 0) throw new ToolInputError("Amount must be positive");
   if (Math.abs(Math.round(amount * 100) - amount * 100) > 1e-6) throw new ToolInputError("Amount has more than 2 decimal places");
+}
+
+export type Measured = {
+  envelopes: { id: TEnvelopeId; name: string; currency: string; assigned: number; available: number }[];
+  toBeAssigned: { month: Month; currency: string; value: number }[];
+};
+
+/** The figures a preview shows, measured on any snapshot. */
+export function measure(view: View, month: Month, watched: Plan["watched"]): Measured {
+  const envs = view.envelopes();
+  const metrics = view.graph.envMetrics(view.data)[month];
+  const totals = view.graph.monthTotals(view.data);
+  const cur = view.displayCurrency;
+  return {
+    envelopes: watched.envelopes.map(id => {
+      const c = envs[id].currency;
+      return {
+        id,
+        name: envs[id].name,
+        currency: c,
+        assigned: view.convert(metrics[id].totalAssigned, c, month),
+        available: view.convert(metrics[id].totalAvailable, c, month),
+      };
+    }),
+    toBeAssigned: watched.months.map(m => ({ month: m, currency: cur, value: view.convert(totals[m].toBeAssigned, cur, m) })),
+  };
+}
+
+const VOLATILE = new Set(["changed", "created", "stamp", "serverTimestamp"]);
+
+/** The transport without send times, with created rows' random ids replaced by stable names. */
+export function canonicalTransport(transport: TNormalizedPatch, base: TDataStore): unknown {
+  const fresh: string[] = [];
+  const b = base as unknown as Record<string, Record<string, unknown>>;
+  for (const [key, rows] of Object.entries(transport as Record<string, unknown>)) {
+    if (!Array.isArray(rows) || key === "deletion") continue;
+    for (const row of rows as { id: string | number }[]) if (b[key]?.[row.id] === undefined) fresh.push(String(row.id));
+  }
+  let json = JSON.stringify(transport);
+  fresh.forEach((id, i) => (json = json.split(id).join(`new#${i}`)));
+  return strip(JSON.parse(json));
+}
+
+function strip(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(strip);
+  if (v && typeof v === "object")
+    return Object.fromEntries(Object.entries(v).filter(([k]) => !VOLATILE.has(k)).map(([k, x]) => [k, strip(x)]));
+  return v;
+}
+
+/** JSON with sorted keys, so equal content always hashes equally. */
+export function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object")
+    return `{${Object.keys(v)
+      .sort()
+      .map(k => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  return JSON.stringify(v) ?? "null";
 }

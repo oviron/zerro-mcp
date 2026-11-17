@@ -2,10 +2,10 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Ctx } from "../server";
 import { patchToWire } from "../zenmoney/wire";
-import { UnknownOutcomeError } from "../zenmoney/client";
+import { ZenMoneyError } from "../zenmoney/client";
 import { View, ToolInputError, fmt } from "../view";
 import { checkHiddenDocuments, Journal, WriteLock } from "../write/guard";
-import { describePlan, NothingToChange, planAction, requireAmount, requireEnvelopeOrTba, type Action, type Plan } from "../write/plan";
+import { describePlan, measure, NothingToChange, planAction, requireAmount, requireEnvelopeOrTba, stableJson, type Action, type Measured, type Plan } from "../write/plan";
 import { toolText, withErrors } from "./result";
 import type { Snapshot } from "../replica";
 
@@ -102,28 +102,31 @@ export function registerWriteTools(server: McpServer, ctx: Ctx) {
   );
 }
 
-/** The whole pull → compile → (push → verify) cycle is one queue item. */
+/**
+ * The whole pull → compile → (push → verify) cycle is one queue item. A
+ * confirm holds the cross-process lock from before its pull until after its
+ * verification, so two writers never compile against the same old state.
+ */
 async function run(ctx: Ctx, lock: WriteLock, confirm: string | undefined, build: Build) {
   return ctx.replica.exclusive(async () => {
-    await ctx.replica.pull();
-    const snap = ctx.replica.snapshot();
-    let plan: Plan;
+    if (confirm) lock.acquire();
     try {
-      plan = planAction(snap, build(new View(snap, ctx.config.displayCurrency)), ctx.config.displayCurrency);
-    } catch (error) {
-      if (error instanceof NothingToChange) return toolText(error.message);
-      throw error;
-    }
-    if (!confirm) return preview(plan, "Preview — nothing written yet.");
-    if (confirm.trim() !== plan.token)
-      return preview(plan, "The data or the arguments changed since that preview, so nothing was written. New preview:");
-
-    checkHiddenDocuments(snap.data);
-    lock.acquire();
-    try {
+      await ctx.replica.pull();
+      const snap = ctx.replica.snapshot();
+      checkHiddenDocuments(snap.data);
+      let plan: Plan;
+      try {
+        plan = planAction(snap, build(new View(snap, ctx.config.displayCurrency)), ctx.config.displayCurrency);
+      } catch (error) {
+        if (error instanceof NothingToChange) return toolText(error.message);
+        throw error;
+      }
+      if (!confirm) return preview(plan, "Preview — nothing written yet.");
+      if (confirm.trim() !== plan.token)
+        return preview(plan, "The data or the arguments changed since that preview, so nothing was written. New preview:");
       return await execute(ctx, snap, plan);
     } finally {
-      lock.release();
+      if (confirm) lock.release();
     }
   });
 }
@@ -147,11 +150,12 @@ async function execute(ctx: Ctx, before: Snapshot, plan: Plan) {
   try {
     await ctx.replica.push(plan.transport);
   } catch (error) {
-    if (!(error instanceof UnknownOutcomeError)) {
-      journal.close({ status: "rejected", error: (error as Error).message });
+    if (error instanceof ZenMoneyError) {
+      journal.close({ status: "refused", error: error.message });
       throw error;
     }
-    sendError = error.message;
+    // Anything else — a timeout, a 5xx, an unreadable answer — may have been applied.
+    sendError = (error as Error).message;
     journal.update({ status: "unknown", error: sendError });
   }
 
@@ -159,38 +163,52 @@ async function execute(ctx: Ctx, before: Snapshot, plan: Plan) {
     await ctx.replica.pull();
   } catch (error) {
     journal.update({ status: "unverified", verifyError: (error as Error).message });
-    return toolText(
-      `${sendError ? `The write may or may not have reached ZenMoney (${sendError}).` : "Sent."} ` +
-        `Could not pull to verify: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
-    );
-  }
-
-  const mismatches = verify(ctx, before, plan);
-  if (!mismatches.length) {
-    journal.close({ status: "confirmed", recovered: !!sendError });
     return {
-      ...toolText(`Written and confirmed on the server${sendError ? " (the answer was lost, but the pull shows the change)" : ""}.\n${describePlan(plan)}`),
-      structuredContent: summary(plan, { status: "confirmed" }),
+      ...toolText(
+        `${sendError ? `The write may or may not have reached ZenMoney (${sendError}).` : "Sent."} ` +
+          `Could not pull to verify: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
+      ),
+      structuredContent: summary(plan, { status: "unverified" }),
+      isError: true,
     };
   }
-  journal.update({ status: sendError ? "unknown" : "unconfirmed", mismatches });
+
+  const view = new View(ctx.replica.snapshot(), ctx.config.displayCurrency);
+  const mismatches = [...verifyBudgets(view, before, plan), ...verifyRows(view, plan)];
+  if (mismatches.length) {
+    journal.update({ status: sendError ? "unknown" : "unconfirmed", mismatches });
+    return {
+      ...toolText(
+        `${sendError ? `The write may not have reached ZenMoney (${sendError}).` : "Sent, but the server state differs from the preview."} Nothing will be retried.\n` +
+          `- ${mismatches.join("\n- ")}\nJournal with the previous rows: ${journal.path}`,
+      ),
+      structuredContent: summary(plan, { status: "unconfirmed", mismatches }),
+      isError: true,
+    };
+  }
+
+  // The write is exactly as planned; the figures are re-measured, since other
+  // data (a new transaction, rates) may have moved them since the preview.
+  const now = measure(view, plan.action.month, plan.watched);
+  const drift = describeDrift(plan, now);
+  journal.close({ status: "confirmed", recovered: !!sendError, drift });
+  const lines = [`Written and confirmed on the server${sendError ? " (the answer was lost, but the pull shows the change)" : ""}.`];
+  lines.push("Budget changes:", ...plan.changes.map(c => `- ${c.month} ${c.name} [${c.id}]: ${fmt(c.from, c.currency)} → ${fmt(c.to, c.currency)}`));
+  lines.push(`Now in ${plan.action.month}:`, ...now.envelopes.map(e => `- ${e.name}: assigned ${fmt(e.assigned, e.currency)}, available ${fmt(e.available, e.currency)}`));
+  lines.push(...now.toBeAssigned.map(t => `To be assigned in ${t.month}: ${fmt(t.value, t.currency)}`));
+  if (drift.length) lines.push("Other data changed since the preview, so these figures differ from it:", ...drift.map(d => `- ${d}`));
   return {
-    ...toolText(
-      `${sendError ? `The write may not have reached ZenMoney (${sendError}).` : "Sent, but the server state differs from the preview."} Nothing will be retried.\n` +
-        `- ${mismatches.join("\n- ")}\nJournal with the previous rows: ${journal.path}`,
-    ),
-    structuredContent: summary(plan, { status: "unconfirmed", mismatches }),
-    isError: true,
+    ...toolText(lines.join("\n")),
+    structuredContent: { ...summary(plan, { status: "confirmed" }), now, drift },
   };
 }
 
-/** Every month's own-assignments must equal the plan's, other keys untouched. */
-function verify(ctx: Ctx, before: Snapshot, plan: Plan): string[] {
-  const view = new View(ctx.replica.snapshot(), ctx.config.displayCurrency);
+/** Every month's own-assignments must equal the plan's. */
+function verifyBudgets(view: View, before: Snapshot, plan: Plan): string[] {
   const actual = view.graph.budgets(view.data) as Record<string, Record<string, number>>;
   const expected = plan.expectedBudgets;
   const envs = view.envelopes();
-  const old = new View(before, ctx.config.displayCurrency).graph.budgets(before.data) as Record<string, Record<string, number>>;
+  const old = before.graph.budgets(before.data) as Record<string, Record<string, number>>;
   const out: string[] = [];
   for (const month of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
     for (const id of new Set([...Object.keys(expected[month] ?? {}), ...Object.keys(actual[month] ?? {})])) {
@@ -207,6 +225,44 @@ function verify(ctx: Ctx, before: Snapshot, plan: Plan): string[] {
       );
     }
   }
+  return out;
+}
+
+/** Every sent row must be on the server as sent, every sent deletion gone. */
+function verifyRows(view: View, plan: Plan): string[] {
+  const data = view.data as unknown as Record<string, Record<string, unknown>>;
+  const out: string[] = [];
+  for (const [key, rows] of Object.entries(plan.transport as Record<string, unknown>)) {
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows as { id: string | number; object?: string }[]) {
+      if (key === "deletion") {
+        if (data[row.object as string]?.[row.id] !== undefined) out.push(`${row.object} ${row.id} is still on the server`);
+        continue;
+      }
+      const server = data[key]?.[row.id];
+      if (!server) out.push(`${key} ${row.id} is missing on the server`);
+      else if (stableJson(withoutTime(server)) !== stableJson(withoutTime(row))) out.push(`${key} ${row.id} differs from what was sent`);
+    }
+  }
+  return out;
+}
+
+const withoutTime = (row: unknown) => {
+  const { changed: _c, ...rest } = row as Record<string, unknown>;
+  return rest;
+};
+
+function describeDrift(plan: Plan, now: Measured): string[] {
+  const out: string[] = [];
+  now.envelopes.forEach((e, i) => {
+    const p = plan.effects[i];
+    if (p.assigned[1] !== e.assigned) out.push(`${e.name} assigned ${fmt(e.assigned, e.currency)}, preview said ${fmt(p.assigned[1], e.currency)}`);
+    if (p.available[1] !== e.available) out.push(`${e.name} available ${fmt(e.available, e.currency)}, preview said ${fmt(p.available[1], e.currency)}`);
+  });
+  now.toBeAssigned.forEach((t, i) => {
+    const p = plan.toBeAssigned[i];
+    if (p.after !== t.value) out.push(`To be assigned in ${t.month} ${fmt(t.value, t.currency)}, preview said ${fmt(p.after, t.currency)}`);
+  });
   return out;
 }
 

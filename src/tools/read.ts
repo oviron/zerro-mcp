@@ -32,9 +32,20 @@ function figures(view: View, m: TEnvMetrics, scope: "self" | "total", month: Mon
 const figText = (f: Figures, c: string) =>
   `leftover ${fmt(f.leftover, c)} · assigned ${fmt(f.assigned, c)} · activity ${fmt(f.activity, c)} · available ${fmt(f.available, c)}`;
 
+/** incomePercent stores a share of income (0.25 is 25%); the other types an amount. */
+const goalAmount = (g: TGoalInfo) =>
+  g.goal.type === "incomePercent" ? `${Math.round(g.goal.amount * 10000) / 100}% of income` : fmt(g.goal.amount, g.currency);
+
 function goalText(g: TGoalInfo): string {
   const end = g.goal.end ? ` by ${g.goal.end}` : "";
-  return `goal ${g.goal.type} ${fmt(g.goal.amount, g.currency)}${end}: need now ${fmt(g.needNow, g.currency)}, progress ${Math.round(g.progress * 100)}%`;
+  return `goal ${g.goal.type} ${goalAmount(g)}${end}: need now ${fmt(g.needNow, g.currency)}, progress ${Math.round(g.progress * 100)}%`;
+}
+
+/** The month whose stored goals last mention this envelope, at or before `month`. */
+function goalSetIn(view: View, id: TEnvelopeId, month: Month): Month | null {
+  const raw = view.graph.rawGoals(view.data) as Record<string, Record<string, unknown> | undefined>;
+  const months = Object.keys(raw).filter(m => m <= month).sort().reverse();
+  return (months.find(m => raw[m] && id in raw[m]!) as Month | undefined) ?? null;
 }
 
 export function registerReadTools(server: McpServer, ctx: Ctx) {
@@ -242,7 +253,7 @@ export function registerReadTools(server: McpServer, ctx: Ctx) {
     {
       title: "Get Zerro Goals",
       description:
-        "Envelope goals in effect for a month (a goal set in an earlier month carries on until changed or past its end): type, amount, end date, how much the envelope still needs this month, progress, plus totals. Types: monthly (assign this much each month), monthlySpend (spend up to this much), targetBalance (reach this balance, by the end date if set), incomePercent (share of income).",
+        "Envelope goals in effect for a month (a goal set in an earlier month carries on until changed or past its end): type, amount, end date, how much the envelope still needs this month, progress, plus totals. Types: monthly (assign this much each month), monthlySpend (spend up to this much), targetBalance (reach this balance, by the end date if set), incomePercent (share of income; its amount is a fraction, 0.25 = 25%).",
       inputSchema: { month: monthArg },
       annotations: READ,
     },
@@ -258,7 +269,7 @@ export function registerReadTools(server: McpServer, ctx: Ctx) {
         name: envs[g.id]?.name ?? g.id,
         ...g.goal,
         currency: g.currency,
-        setIn: g.month,
+        setIn: goalSetIn(view, g.id, month),
         needNow: g.needNow,
         targetBudget: g.targetBudget,
         progress: g.progress,

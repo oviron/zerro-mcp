@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { patchToWire, wireToPatch } from "../src/zenmoney/wire";
@@ -38,6 +39,16 @@ describe("read tools", () => {
     const { call } = await connect();
     const r = await call("get_envelope_activity", { envelope: "Food", month: "2026-11" });
     expect(r.data!.transactions.map((t: any) => t.id)).toEqual(["groceries"]);
+  });
+
+  it("reports where an inherited goal was set and shows percent goals as percent", async () => {
+    const server = new FakeZenMoney();
+    const doc = server.get("reminder", BUDGET_DOC)!;
+    server.write({ reminder: [{ ...doc, id: "goals-10", comment: JSON.stringify({ type: "goals", month: "2026-10", payload: { "tag#home": { type: "incomePercent", amount: 0.25 } } }) }] } as any);
+    const { call } = await connect({ server });
+    const r = await call("get_goals", { month: "2026-11" });
+    expect(r.data!.goals[0]).toMatchObject({ envelope: "tag#home", setIn: "2026-10", amount: 0.25 });
+    expect(r.text).toMatch(/25% of income/);
   });
 
   it("rejects months outside Zerro's range", async () => {
@@ -153,11 +164,118 @@ describe("write tools", () => {
     const doc = server.get("reminder", BUDGET_DOC)!;
     server.write({ reminder: [{ ...doc, id: "dup" }] } as any);
     const { call } = await connect({ write: true, server });
-    const p = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
-    const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11", confirm: p.data!.token });
+    const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/stored twice/);
     expect(server.pushes()).toHaveLength(0);
+  });
+
+  it("finds duplicates on any account, as the core does, and ignores plain comments", async () => {
+    const server = new FakeZenMoney();
+    const doc = server.get("reminder", BUDGET_DOC)!;
+    server.write({ reminder: [
+      { ...doc, id: "note", comment: "just a note" },
+      { ...doc, id: "elsewhere", incomeAccount: "card", outcomeAccount: "card" },
+    ] } as any);
+    const { call } = await connect({ write: true, server });
+    const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
+    expect(r.text).toMatch(/stored twice \(reminders doc-budgets-2026-11 and elsewhere\)/);
+    expect(r.text).not.toMatch(/note/);
+  });
+
+  it("refuses payloads Zerro would misread", async () => {
+    const server = new FakeZenMoney();
+    const doc = server.get("reminder", BUDGET_DOC)!;
+    server.write({ reminder: [{ ...doc, id: "settings", comment: JSON.stringify({ type: "UserSettings", payload: { preferZmBudgets: "false" } }) }] } as any);
+    const { call } = await connect({ write: true, server });
+    const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/preferZmBudgets is not a boolean/);
+  });
+
+  it("changes the token when other budgets move, even if totals stay", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Cafe", amount: 100, month: "2026-11" };
+    const a = await call("set_envelope_budget", args);
+    const doc = fake.get("reminder", BUDGET_DOC)!;
+    // Food and Home swap 100 between them in another client: same sum, different budgets.
+    fake.write({ reminder: [{ ...doc, changed: (doc.changed as number) + 5, comment: JSON.stringify({ type: "budgets", month: "2026-11", payload: { "tag#food": 900, "tag#home": 600 } }) }] } as any);
+    const b = await call("set_envelope_budget", args);
+    expect(b.data!.token).not.toBe(a.data!.token);
+  });
+
+  it("changes the token when rates change", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { from: "toBeAssigned", to: "Home", amount: 1, currency: "USD", month: "2026-11" };
+    const a = await call("move_envelope_funds", args);
+    const usd = fake.get("instrument", "1")!;
+    fake.write({ instrument: [{ ...usd, rate: 91, changed: (usd.changed as number) + 5 }] } as any);
+    const r = await call("move_envelope_funds", { ...args, confirm: a.data!.token });
+    expect(r.data).toMatchObject({ status: "preview" });
+    expect(fake.pushes()).toHaveLength(0);
+  });
+
+  it("treats a 503 after the write as an unknown outcome and recovers by pulling", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Food", amount: 1300, month: "2026-11" };
+    const p = await call("set_envelope_budget", args);
+    fake.fault = "error503";
+    const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
+    expect(r.data).toMatchObject({ status: "confirmed" });
+    expect(fake.pushes()).toHaveLength(1);
+  });
+
+  it("closes the journal as refused on a 4xx", async () => {
+    const { call, fake, stateDir } = await connect({ write: true });
+    const args = { envelope: "Food", amount: 1300, month: "2026-11" };
+    const p = await call("set_envelope_budget", args);
+    fake.fault = "refused";
+    const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
+    expect(r.isError).toBe(true);
+    const [file] = readdirSync(join(stateDir, "journal"));
+    expect(JSON.parse(readFileSync(join(stateDir, "journal", file), "utf8")).status).toBe("refused");
+  });
+
+  it("re-measures figures after the write when other data moved them", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Food", amount: 1300, month: "2026-11" };
+    const p = await call("set_envelope_budget", args);
+    fake.afterPush = () =>
+      fake.write({ transaction: [{ ...fake.get("transaction", "groceries")!, id: "more", outcome: 300, changed: 2_000_000_000 }] } as any);
+    const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
+    expect(r.data).toMatchObject({ status: "confirmed" });
+    expect(r.data!.now.envelopes[0]).toMatchObject({ id: "tag#food", available: -200 });
+    expect(r.text).toMatch(/preview said 100 RUB/);
+  });
+
+  it("flags a write that someone overwrote right after it", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Food", amount: 1300, month: "2026-11" };
+    const p = await call("set_envelope_budget", args);
+    fake.afterPush = () => {
+      const doc = fake.get("reminder", BUDGET_DOC)!;
+      fake.write({ reminder: [{ ...doc, changed: (doc.changed as number) + 5, comment: JSON.stringify({ type: "budgets", month: "2026-11", payload: { "tag#food": 1000, "tag#home": 500 } }) }] } as any);
+    };
+    const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
+    expect(r.isError).toBe(true);
+    expect(r.data).toMatchObject({ status: "unconfirmed" });
+    expect(r.text).toMatch(/still 1,000 RUB, expected 1,300 RUB/);
+  });
+
+  it("lets only one process hold the write lock", async () => {
+    const { WriteLock } = await import("../src/write/guard");
+    const dir = mkdtempSync(join(tmpdir(), "zerro-lock-"));
+    const a = new WriteLock(dir);
+    const b = new WriteLock(dir);
+    a.acquire();
+    // Same pid counts as alive, so the second holder is refused rather than stealing.
+    writeFileSync(join(dir, "write.lock"), `${process.ppid}:other`);
+    expect(() => b.acquire()).toThrow(/is writing/);
+    a.release();
+    expect(readFileSync(join(dir, "write.lock"), "utf8")).toBe(`${process.ppid}:other`);
+    writeFileSync(join(dir, "write.lock"), "999999:dead");
+    b.acquire();
+    b.release();
   });
 
   it("creates the Zerro document when a month has none", async () => {
