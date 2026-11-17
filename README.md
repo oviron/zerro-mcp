@@ -54,7 +54,13 @@ document. So each write tool works in two calls:
 2. With `confirm: <token>` it pulls again and recomputes. If anything moved
    (new transactions, rates, someone else's edit), the token no longer matches
    and you get a new preview instead of a write. Otherwise it sends the change,
-   pulls, and checks that every month's assignments are exactly as previewed.
+   pulls, and checks that every row sent is on the server as sent and that
+   every month's assignments are exactly as previewed.
+
+The answer's `status` says how it ended: `confirmed`; `written_figures_changed`
+(the write is exactly as planned, but other data moved the figures meanwhile —
+the answer shows the current ones); `unconfirmed` or `unverified` (the server
+does not show the planned state, or could not be checked — see the journal).
 
 While a write runs, nobody should edit the budget in Zerro, and an open Zerro
 tab must not hold unsent changes. Writes are refused when Zerro's stored
@@ -64,7 +70,10 @@ rows as they were before, what was sent and how it ended; a journal still named
 `*.open.json` is a write whose outcome was not confirmed. A lost answer is
 never retried automatically: the server pulls and reports what it sees.
 
-Enable writing on one machine only, and run one write at a time per account.
+Enable writing on one machine only. Processes on that machine take turns
+through a lock file in `ZERRO_MCP_STATE_DIR`; a lock left by a process that
+died mid-write is not taken over automatically — check the budget and the open
+journal, then delete the lock file.
 
 ## Setup
 

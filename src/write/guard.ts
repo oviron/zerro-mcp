@@ -9,7 +9,8 @@ const MONTHLY_TYPES = new Set(["goals", "budgets", "fxRates"]);
 const GOAL_TYPES = new Set(["monthly", "monthlySpend", "targetBalance", "incomePercent"]);
 const VISIBILITY = new Set(["hidden", "visible", "auto"]);
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
-const DATE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+const isDate = (v: unknown) =>
+  typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
 
 /**
  * Refuses to write when Zerro's stored documents are not what Zerro itself
@@ -71,7 +72,7 @@ function checkPayload(type: string, payload: unknown): string | null {
         if (!isObject(g)) return `goal for ${id} is not an object`;
         if (typeof g.type !== "string" || !GOAL_TYPES.has(g.type)) return `goal for ${id} has unknown type ${JSON.stringify(g.type)}`;
         if (!isNum(g.amount)) return `goal for ${id} has no finite amount`;
-        if (g.end !== undefined && g.end !== null && (typeof g.end !== "string" || !DATE.test(g.end))) return `goal for ${id} has a bad end date`;
+        if (g.end !== undefined && g.end !== null && !isDate(g.end)) return `goal for ${id} has a bad end date`;
       }
       return null;
     case "EnvelopeMeta":
@@ -100,7 +101,9 @@ function checkPayload(type: string, payload: unknown): string | null {
 /**
  * One writer across processes on this machine. The lock file appears
  * atomically with its owner already inside (written aside, then hard-linked),
- * and only the owner removes it.
+ * and only the owner removes it. A lock left by a dead process is not taken
+ * over: that process may have died mid-write, so its journal needs a look
+ * first, and files offer no atomic compare-and-delete to take it over safely.
  */
 export class WriteLock {
   private path: string;
@@ -116,21 +119,15 @@ export class WriteLock {
     const draft = join(this.dir, `write.lock.${owner.replace(":", "-")}`);
     writeFileSync(draft, owner, { mode: 0o600 });
     try {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          linkSync(draft, this.path);
-          this.owner = owner;
-          return;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        }
-        const holder = this.read();
-        const pid = Number(holder?.split(":")[0]);
-        if (holder && pid && alive(pid))
-          throw new ToolInputError(`Another zerro-mcp process (pid ${pid}) is writing. Try again in a moment.`);
-        this.removeStale(holder);
-      }
-      throw new ToolInputError("Could not take the write lock.");
+      linkSync(draft, this.path);
+      this.owner = owner;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const pid = Number(this.read()?.split(":")[0]);
+      if (pid && alive(pid)) throw new ToolInputError(`Another zerro-mcp process (pid ${pid}) is writing. Try again in a moment.`);
+      throw new ToolInputError(
+        `A previous write (pid ${pid || "unknown"}) ended without releasing the lock. Check the budget and any *.open.json journal in ${join(this.dir, "journal")}, then delete ${this.path}.`,
+      );
     } finally {
       rmSync(draft, { force: true });
     }
@@ -147,25 +144,6 @@ export class WriteLock {
     } catch {
       return undefined;
     }
-  }
-
-  /** Moves the lock aside and deletes it only if it is still the dead holder's. */
-  private removeStale(holder: string | undefined) {
-    const aside = join(this.dir, `write.lock.stale-${randomBytes(8).toString("hex")}`);
-    try {
-      renameSync(this.path, aside);
-    } catch {
-      return;
-    }
-    if (readFileSync(aside, "utf8") !== holder) {
-      // A live process took the lock in between: put it back unless yet another one did.
-      try {
-        linkSync(aside, this.path);
-      } catch {
-        /* someone holds a newer lock; theirs stands */
-      }
-    }
-    rmSync(aside, { force: true });
   }
 }
 

@@ -158,7 +158,9 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
     current: before.graph.currentFxRates(before.data).rates,
   };
   const token = createHash("sha256")
-    .update(stableJson({ action, changes, effects, toBeAssigned, versions, rates, expected: b1, sent: canonicalTransport(transport, snap.data) }))
+    .update(
+      stableJson({ action, changes, effects, toBeAssigned, versions, rates, expected: b1, sent: canonicalTransport(transport, snap.data), transactions: transactionsDigest(snap.data) }),
+    )
     .digest("hex")
     .slice(0, 16);
 
@@ -206,7 +208,8 @@ export function measure(view: View, month: Month, watched: Plan["watched"]): Mea
   const totals = view.graph.monthTotals(view.data);
   const cur = view.displayCurrency;
   return {
-    envelopes: watched.envelopes.map(id => {
+    // An envelope can disappear between preview and verification (its category deleted).
+    envelopes: watched.envelopes.filter(id => envs[id] && metrics?.[id]).map(id => {
       const c = envs[id].currency;
       return {
         id,
@@ -216,7 +219,7 @@ export function measure(view: View, month: Month, watched: Plan["watched"]): Mea
         available: view.convert(metrics[id].totalAvailable, c, month),
       };
     }),
-    toBeAssigned: watched.months.map(m => ({ month: m, currency: cur, value: view.convert(totals[m].toBeAssigned, cur, m) })),
+    toBeAssigned: watched.months.filter(m => totals[m]).map(m => ({ month: m, currency: cur, value: view.convert(totals[m].toBeAssigned, cur, m) })),
   };
 }
 
@@ -251,4 +254,11 @@ export function stableJson(v: unknown): string {
       .map(k => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`)
       .join(",")}}`;
   return JSON.stringify(v) ?? "null";
+}
+
+/** Any added, changed or deleted transaction changes this, and with it the token. */
+function transactionsDigest(data: TDataStore): string {
+  const h = createHash("sha256");
+  for (const t of Object.values(data.transaction).sort((a, b) => (a.id < b.id ? -1 : 1))) h.update(`${t.id}:${t.changed};`);
+  return h.digest("hex");
 }

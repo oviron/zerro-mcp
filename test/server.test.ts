@@ -243,7 +243,7 @@ describe("write tools", () => {
     fake.afterPush = () =>
       fake.write({ transaction: [{ ...fake.get("transaction", "groceries")!, id: "more", outcome: 300, changed: 2_000_000_000 }] } as any);
     const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
-    expect(r.data).toMatchObject({ status: "confirmed" });
+    expect(r.data).toMatchObject({ status: "written_figures_changed" });
     expect(r.data!.now.envelopes[0]).toMatchObject({ id: "tag#food", available: -200 });
     expect(r.text).toMatch(/preview said 100 RUB/);
   });
@@ -274,8 +274,36 @@ describe("write tools", () => {
     a.release();
     expect(readFileSync(join(dir, "write.lock"), "utf8")).toBe(`${process.ppid}:other`);
     writeFileSync(join(dir, "write.lock"), "999999:dead");
-    b.acquire();
-    b.release();
+    expect(() => b.acquire()).toThrow(/ended without releasing the lock/);
+  });
+
+  it("changes the token when transactions change, even if the figures do not", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Home", amount: 600, month: "2026-11" };
+    const a = await call("set_envelope_budget", args);
+    const g = fake.get("transaction", "groceries")!;
+    fake.write({ transaction: [{ ...g, outcome: 1000, changed: 2_000_000_000 }, { ...g, id: "g2", outcome: 200, changed: 2_000_000_000 }] } as any);
+    const b = await call("set_envelope_budget", args);
+    expect(b.data!.token).not.toBe(a.data!.token);
+  });
+
+  it("refuses impossible goal dates", async () => {
+    const server = new FakeZenMoney();
+    const doc = server.get("reminder", BUDGET_DOC)!;
+    server.write({ reminder: [{ ...doc, id: "g", comment: JSON.stringify({ type: "goals", month: "2026-10", payload: { "tag#home": { type: "targetBalance", amount: 5, end: "2026-02-31" } } }) }] } as any);
+    const { call } = await connect({ write: true, server });
+    const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
+    expect(r.text).toMatch(/bad end date/);
+  });
+
+  it("reports a write whose envelope disappeared right after it", async () => {
+    const { call, fake } = await connect({ write: true });
+    const args = { envelope: "Cafe", amount: 100, month: "2026-11" };
+    const p = await call("set_envelope_budget", args);
+    fake.afterPush = () => fake.write({ deletion: [{ id: "cafe", object: "tag", stamp: 2_000_000_000, user: 1 }] } as any);
+    const r = await call("set_envelope_budget", { ...args, confirm: p.data!.token });
+    expect(r.text).not.toMatch(/Internal error/);
+    expect(r.text).toMatch(/Cafe/);
   });
 
   it("creates the Zerro document when a month has none", async () => {

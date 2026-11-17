@@ -173,6 +173,22 @@ async function execute(ctx: Ctx, before: Snapshot, plan: Plan) {
     };
   }
 
+  try {
+    return finish(ctx, before, plan, journal, sendError);
+  } catch (error) {
+    journal.update({ status: "unverified", verifyError: (error as Error).message });
+    return {
+      ...toolText(
+        `${sendError ? `The write may or may not have reached ZenMoney (${sendError}).` : "Sent."} ` +
+          `Verification failed: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
+      ),
+      structuredContent: summary(plan, { status: "unverified" }),
+      isError: true,
+    };
+  }
+}
+
+function finish(ctx: Ctx, before: Snapshot, plan: Plan, journal: Journal, sendError: string | undefined) {
   const view = new View(ctx.replica.snapshot(), ctx.config.displayCurrency);
   const mismatches = [...verifyBudgets(view, before, plan), ...verifyRows(view, plan)];
   if (mismatches.length) {
@@ -189,17 +205,21 @@ async function execute(ctx: Ctx, before: Snapshot, plan: Plan) {
 
   // The write is exactly as planned; the figures are re-measured, since other
   // data (a new transaction, rates) may have moved them since the preview.
+  // Drift is not a failed write: every sent row is on the server as sent.
+  // It gets its own status so the agent neither retries nor trusts old figures.
   const now = measure(view, plan.action.month, plan.watched);
   const drift = describeDrift(plan, now);
-  journal.close({ status: "confirmed", recovered: !!sendError, drift });
+  const status = drift.length ? "written_figures_changed" : "confirmed";
+  journal.close({ status, recovered: !!sendError, drift });
   const lines = [`Written and confirmed on the server${sendError ? " (the answer was lost, but the pull shows the change)" : ""}.`];
   lines.push("Budget changes:", ...plan.changes.map(c => `- ${c.month} ${c.name} [${c.id}]: ${fmt(c.from, c.currency)} → ${fmt(c.to, c.currency)}`));
   lines.push(`Now in ${plan.action.month}:`, ...now.envelopes.map(e => `- ${e.name}: assigned ${fmt(e.assigned, e.currency)}, available ${fmt(e.available, e.currency)}`));
   lines.push(...now.toBeAssigned.map(t => `To be assigned in ${t.month}: ${fmt(t.value, t.currency)}`));
-  if (drift.length) lines.push("Other data changed since the preview, so these figures differ from it:", ...drift.map(d => `- ${d}`));
+  if (drift.length)
+    lines.push("Other data changed meanwhile (new transactions, rates or edits), so these figures differ from the preview:", ...drift.map(d => `- ${d}`));
   return {
     ...toolText(lines.join("\n")),
-    structuredContent: { ...summary(plan, { status: "confirmed" }), now, drift },
+    structuredContent: { ...summary(plan, { status }), now, drift },
   };
 }
 
@@ -254,13 +274,14 @@ const withoutTime = (row: unknown) => {
 
 function describeDrift(plan: Plan, now: Measured): string[] {
   const out: string[] = [];
-  now.envelopes.forEach((e, i) => {
-    const p = plan.effects[i];
+  for (const p of plan.effects) if (!now.envelopes.some(e => e.id === p.id)) out.push(`${p.name} no longer exists`);
+  now.envelopes.forEach(e => {
+    const p = plan.effects.find(x => x.id === e.id)!;
     if (p.assigned[1] !== e.assigned) out.push(`${e.name} assigned ${fmt(e.assigned, e.currency)}, preview said ${fmt(p.assigned[1], e.currency)}`);
     if (p.available[1] !== e.available) out.push(`${e.name} available ${fmt(e.available, e.currency)}, preview said ${fmt(p.available[1], e.currency)}`);
   });
-  now.toBeAssigned.forEach((t, i) => {
-    const p = plan.toBeAssigned[i];
+  now.toBeAssigned.forEach(t => {
+    const p = plan.toBeAssigned.find(x => x.month === t.month)!;
     if (p.after !== t.value) out.push(`To be assigned in ${t.month} ${fmt(t.value, t.currency)}, preview said ${fmt(p.after, t.currency)}`);
   });
   return out;
