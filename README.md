@@ -84,7 +84,7 @@ Get a ZenMoney token at <https://zerro.app/token>.
   "mcpServers": {
     "zerro": {
       "command": "npx",
-      "args": ["-y", "--package=https://github.com/oviron/zerro-mcp/releases/download/v0.1.0/zerro-mcp-0.1.0.tgz", "zerro-mcp"],
+      "args": ["-y", "--package=https://github.com/oviron/zerro-mcp/releases/download/v0.1.1/zerro-mcp-0.1.1.tgz", "zerro-mcp"],
       "env": { "ZENMONEY_TOKEN": "…" }
     }
   }
