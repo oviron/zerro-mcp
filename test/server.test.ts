@@ -287,10 +287,10 @@ describe("write tools", () => {
     expect(b.data!.token).not.toBe(a.data!.token);
   });
 
-  it("refuses impossible goal dates", async () => {
+  it.each(["2026-02-31", "2026-13-01", "2026-00-01", "2026-01-32"])("refuses impossible goal date %s", async end => {
     const server = new FakeZenMoney();
     const doc = server.get("reminder", BUDGET_DOC)!;
-    server.write({ reminder: [{ ...doc, id: "g", comment: JSON.stringify({ type: "goals", month: "2026-10", payload: { "tag#home": { type: "targetBalance", amount: 5, end: "2026-02-31" } } }) }] } as any);
+    server.write({ reminder: [{ ...doc, id: "g", comment: JSON.stringify({ type: "goals", month: "2026-10", payload: { "tag#home": { type: "targetBalance", amount: 5, end } } }) }] } as any);
     const { call } = await connect({ write: true, server });
     const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
     expect(r.text).toMatch(/bad end date/);

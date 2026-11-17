@@ -10,7 +10,10 @@ const GOAL_TYPES = new Set(["monthly", "monthlySpend", "targetBalance", "incomeP
 const VISIBILITY = new Set(["hidden", "visible", "auto"]);
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const isDate = (v: unknown) =>
-  typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
+  typeof v === "string" &&
+  /^\d{4}-\d{2}-\d{2}$/.test(v) &&
+  !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) &&
+  new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
 
 /**
  * Refuses to write when Zerro's stored documents are not what Zerro itself
