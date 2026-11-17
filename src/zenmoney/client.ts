@@ -1,4 +1,4 @@
-import type { WireDiff } from "./wire";
+import { WIRE_KEYS, type WireDiff } from "./wire";
 
 /** Thrown when the request may have reached the server but no answer came back. */
 export class UnknownOutcomeError extends Error {}
@@ -41,14 +41,15 @@ export class ZenMoneyClient implements DiffClient {
       throw new UnknownOutcomeError(`ZenMoney API request failed: ${reason}`);
     }
     const status = response.status;
+    // Only a 4xx is a definite refusal; anything else may have been applied.
+    const refused = status >= 400 && status < 500 && status !== 408;
     let text: string;
     try {
       text = await response.text();
     } catch {
+      if (refused) throw new ZenMoneyError(`ZenMoney API refused the request (HTTP ${status})`, status);
       throw new UnknownOutcomeError(`ZenMoney API answer was cut off (HTTP ${status})`);
     }
-    // Only a 4xx is a definite refusal; anything else may have been applied.
-    const refused = status >= 400 && status < 500 && status !== 408;
     let json: unknown;
     try {
       json = JSON.parse(text);
@@ -60,6 +61,38 @@ export class ZenMoneyClient implements DiffClient {
     if (refused) throw new ZenMoneyError(`ZenMoney API refused the request (HTTP ${status})${apiError ? `: ${JSON.stringify(apiError)}` : ""}`, status);
     if (apiError || status < 200 || status >= 300)
       throw new UnknownOutcomeError(`ZenMoney API failed (HTTP ${status})${apiError ? `: ${JSON.stringify(apiError)}` : ""}`);
+    const malformed = malformedPart(json);
+    if (malformed) throw new UnknownOutcomeError(`Malformed ZenMoney answer: ${malformed}`);
     return json as WireDiff;
   }
+}
+
+/** Fields every row of a collection carries; ZenMoney always sends whole rows. */
+const REQUIRED: Record<string, string[]> = {
+  country: ["id"],
+  budget: ["date", "tag", "changed"],
+  reminder: ["id", "changed", "comment"],
+  deletion: ["id", "object", "stamp"],
+};
+
+/**
+ * An answer of the wrong shape must not pass for a sync: the core merges rows
+ * into the ones it has, so a skipped or partial row would read as unchanged.
+ */
+function malformedPart(json: unknown): string | undefined {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return "not an object";
+  const diff = json as Record<string, unknown>;
+  if (typeof diff.serverTimestamp !== "number" || !Number.isFinite(diff.serverTimestamp)) return "no serverTimestamp";
+  for (const key of WIRE_KEYS) {
+    const rows = diff[key];
+    if (rows === undefined) continue;
+    if (!Array.isArray(rows)) return `${key} is not a list`;
+    const fields = REQUIRED[key] ?? ["id", "changed"];
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return `${key} has a row that is not an object`;
+      const missing = fields.find(f => !(f in row));
+      if (missing) return `${key} row without ${missing}`;
+    }
+  }
+  return undefined;
 }

@@ -23,13 +23,9 @@ export type Action =
 /** One own-assignment that the action changes, in the envelope currency. */
 export type BudgetChange = { month: Month; id: TEnvelopeId; name: string; currency: string; from: number; to: number };
 
-export type EnvelopeEffect = {
-  id: TEnvelopeId;
-  name: string;
-  currency: string;
-  assigned: [number, number];
-  available: [number, number];
-};
+type Change = { before: number; after: number };
+
+export type EnvelopeEffect = { id: TEnvelopeId; name: string; currency: string; assigned: Change; available: Change };
 
 export type Plan = {
   action: Action;
@@ -46,7 +42,11 @@ export type Plan = {
   watched: { envelopes: TEnvelopeId[]; months: Month[] };
 };
 
-export class NothingToChange extends Error {}
+export class NothingToChange extends Error {
+  constructor() {
+    super("Nothing to change: the budget already looks like that.");
+  }
+}
 
 function compile(view: View, action: Action): TCompiled {
   const { data, graph, ctx } = view.snap;
@@ -78,7 +78,7 @@ const budgetsOf = (view: View) => view.graph.budgets(view.data) as Record<string
 export function planAction(snap: Snapshot, action: Action, displayCurrency?: string): Plan {
   const before = new View(snap, displayCurrency);
   const compiled = compile(before, action);
-  if (!compiled.operations.length) throw new NothingToChange("Nothing to change: the budget already looks like that.");
+  if (!compiled.operations.length) throw new NothingToChange();
   const issuedAt = snap.ctx.now();
   let current: TDataStore;
   let transport: TNormalizedPatch | undefined;
@@ -87,10 +87,10 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
     current = staged.current;
     transport = buildOutboxTransport(snap.data, staged.outbox, issuedAt);
   } catch (error) {
-    if ((error as Error).message.includes("did not change")) throw new NothingToChange("Nothing to change: the budget already looks like that.");
+    if ((error as Error).message.includes("did not change")) throw new NothingToChange();
     throw error;
   }
-  if (!transport) throw new NothingToChange("Nothing to change: the budget already looks like that.");
+  if (!transport) throw new NothingToChange();
 
   const after = new View({ ...snap, data: current, graph: createProjectionGraph(snap.ctx) }, displayCurrency);
   const envs = before.envelopes();
@@ -125,12 +125,10 @@ export function planAction(snap: Snapshot, action: Action, displayCurrency?: str
   const will = measure(after, action.month, watched);
   const effects: EnvelopeEffect[] = will.envelopes.map((e, i) => ({
     ...e,
-    assigned: [was.envelopes[i].assigned, e.assigned],
-    available: [was.envelopes[i].available, e.available],
+    assigned: { before: was.envelopes[i].assigned, after: e.assigned },
+    available: { before: was.envelopes[i].available, after: e.available },
   }));
-  const toBeAssigned = will.toBeAssigned.map((t, i) => ({ ...t, before: was.toBeAssigned[i].value, after: t.value })).map(
-    ({ value: _v, ...t }) => t,
-  );
+  const toBeAssigned = will.toBeAssigned.map(({ value, ...t }, i) => ({ ...t, before: was.toBeAssigned[i].value, after: value }));
 
   const original: Record<string, unknown[]> = {};
   const versions: Record<string, unknown> = {};
@@ -176,7 +174,7 @@ export function describePlan(plan: Plan): string {
     lines.push(`Envelopes in ${plan.action.month} (with children):`);
     for (const e of plan.effects)
       lines.push(
-        `- ${e.name}: assigned ${fmt(e.assigned[0], e.currency)} → ${fmt(e.assigned[1], e.currency)}, available ${fmt(e.available[0], e.currency)} → ${fmt(e.available[1], e.currency)}`,
+        `- ${e.name}: assigned ${fmt(e.assigned.before, e.currency)} → ${fmt(e.assigned.after, e.currency)}, available ${fmt(e.available.before, e.currency)} → ${fmt(e.available.after, e.currency)}`,
       );
   }
   for (const t of plan.toBeAssigned)
@@ -228,7 +226,7 @@ export function measure(view: View, month: Month, watched: Plan["watched"]): Mea
 const VOLATILE = new Set(["changed", "created", "stamp", "serverTimestamp"]);
 
 /** The transport without send times, with created rows' random ids replaced by stable names. */
-export function canonicalTransport(transport: TNormalizedPatch, base: TDataStore): unknown {
+function canonicalTransport(transport: TNormalizedPatch, base: TDataStore): unknown {
   const fresh: string[] = [];
   const b = base as unknown as Record<string, Record<string, unknown>>;
   for (const [key, rows] of Object.entries(transport as Record<string, unknown>)) {
@@ -248,7 +246,7 @@ function strip(v: unknown): unknown {
 }
 
 /** JSON with sorted keys, so equal content always hashes equally. */
-export function stableJson(v: unknown): string {
+function stableJson(v: unknown): string {
   if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
   if (v && typeof v === "object")
     return `{${Object.keys(v)
@@ -258,14 +256,25 @@ export function stableJson(v: unknown): string {
   return JSON.stringify(v) ?? "null";
 }
 
-/** Any added, edited or deleted transaction changes this, and with it the token. */
+const digests = new WeakMap<object, string>();
+
+/**
+ * Any added, edited or deleted transaction changes this, and with it the token.
+ * The core replaces the transaction map only when transactions change, so the
+ * digest of ~14k rows is computed once per change, not per call.
+ */
 function transactionsDigest(data: TDataStore): string {
-  const h = createHash("sha256");
-  for (const t of Object.values(data.transaction).sort((a, b) => (a.id < b.id ? -1 : 1))) h.update(`${contentHash(t)};`);
-  return h.digest("hex");
+  let digest = digests.get(data.transaction);
+  if (!digest) {
+    const h = createHash("sha256");
+    for (const t of Object.values(data.transaction).sort((a, b) => (a.id < b.id ? -1 : 1))) h.update(`${contentHash(t)};`);
+    digest = h.digest("hex");
+    digests.set(data.transaction, digest);
+  }
+  return digest;
 }
 
 /** A row's content without its timestamps, which ZenMoney does not report stably. */
-function contentHash(row: unknown): string {
+export function contentHash(row: unknown): string {
   return createHash("sha256").update(stableJson(strip(row))).digest("hex").slice(0, 16);
 }

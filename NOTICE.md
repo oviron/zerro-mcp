@@ -10,7 +10,7 @@ test files were left out.
 - Copied: `internal/`, `public/`, `headless.ts`, `types.ts`, `constants.ts`
 
 The rest of this repository is distributed under the same license (see
-`LICENSE`). The built `build/index.js` also bundles the npm packages listed in
-`package.json` (`@modelcontextprotocol/sdk`, `zod`, `decimal.js-light`,
-`tldts` and their dependencies), all under permissive licenses; their notices
-are kept at the end of the file.
+`LICENSE`). The built `build/index.js` also bundles npm packages
+(`@modelcontextprotocol/sdk`, `zod`, `decimal.js-light`, `tldts` and their
+dependencies), all under permissive licenses; the build writes their license
+texts to `build/THIRD_PARTY_LICENSES.md`, which ships with the package.

@@ -5,7 +5,7 @@ import { patchToWire } from "../zenmoney/wire";
 import { ZenMoneyError } from "../zenmoney/client";
 import { View, ToolInputError, fmt } from "../view";
 import { checkHiddenDocuments, Journal, WriteLock } from "../write/guard";
-import { describePlan, measure, NothingToChange, planAction, requireAmount, requireEnvelopeOrTba, stableJson, type Action, type Measured, type Plan } from "../write/plan";
+import { contentHash, describePlan, measure, NothingToChange, planAction, requireAmount, requireEnvelopeOrTba, type Action, type Measured, type Plan } from "../write/plan";
 import { toolText, withErrors } from "./result";
 import type { Snapshot } from "../replica";
 
@@ -161,26 +161,13 @@ async function execute(ctx: Ctx, before: Snapshot, plan: Plan) {
 
   try {
     await ctx.replica.pull();
-  } catch (error) {
-    journal.update({ status: "unverified", verifyError: (error as Error).message });
-    return {
-      ...toolText(
-        `${sendError ? `The write may or may not have reached ZenMoney (${sendError}).` : "Sent."} ` +
-          `Could not pull to verify: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
-      ),
-      structuredContent: summary(plan, { status: "unverified" }),
-      isError: true,
-    };
-  }
-
-  try {
     return finish(ctx, before, plan, journal, sendError);
   } catch (error) {
     journal.update({ status: "unverified", verifyError: (error as Error).message });
     return {
       ...toolText(
         `${sendError ? `The write may or may not have reached ZenMoney (${sendError}).` : "Sent."} ` +
-          `Verification failed: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
+          `Could not verify: ${(error as Error).message}. Nothing will be retried; check with get_envelopes. Journal: ${journal.path}`,
       ),
       structuredContent: summary(plan, { status: "unverified" }),
       isError: true,
@@ -261,24 +248,19 @@ function verifyRows(view: View, plan: Plan): string[] {
       }
       const server = data[key]?.[row.id];
       if (!server) out.push(`${key} ${row.id} is missing on the server`);
-      else if (stableJson(withoutTime(server)) !== stableJson(withoutTime(row))) out.push(`${key} ${row.id} differs from what was sent`);
+      else if (contentHash(server) !== contentHash(row)) out.push(`${key} ${row.id} differs from what was sent`);
     }
   }
   return out;
 }
-
-const withoutTime = (row: unknown) => {
-  const { changed: _c, ...rest } = row as Record<string, unknown>;
-  return rest;
-};
 
 function describeDrift(plan: Plan, now: Measured): string[] {
   const out: string[] = [];
   for (const p of plan.effects) if (!now.envelopes.some(e => e.id === p.id)) out.push(`${p.name} no longer exists`);
   now.envelopes.forEach(e => {
     const p = plan.effects.find(x => x.id === e.id)!;
-    if (p.assigned[1] !== e.assigned) out.push(`${e.name} assigned ${fmt(e.assigned, e.currency)}, preview said ${fmt(p.assigned[1], e.currency)}`);
-    if (p.available[1] !== e.available) out.push(`${e.name} available ${fmt(e.available, e.currency)}, preview said ${fmt(p.available[1], e.currency)}`);
+    if (p.assigned.after !== e.assigned) out.push(`${e.name} assigned ${fmt(e.assigned, e.currency)}, preview said ${fmt(p.assigned.after, e.currency)}`);
+    if (p.available.after !== e.available) out.push(`${e.name} available ${fmt(e.available, e.currency)}, preview said ${fmt(p.available.after, e.currency)}`);
   });
   now.toBeAssigned.forEach(t => {
     const p = plan.toBeAssigned.find(x => x.month === t.month)!;
@@ -292,7 +274,7 @@ function summary(plan: Plan, extra: Record<string, unknown>) {
     ...extra,
     action: plan.action,
     changes: plan.changes,
-    envelopes: plan.effects.map(e => ({ ...e, assigned: { before: e.assigned[0], after: e.assigned[1] }, available: { before: e.available[0], after: e.available[1] } })),
+    envelopes: plan.effects,
     toBeAssigned: plan.toBeAssigned,
   };
 }

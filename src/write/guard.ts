@@ -91,6 +91,10 @@ function checkPayload(type: string, payload: unknown): string | null {
           return `meta visibility for ${id} is ${JSON.stringify(m.visibility)}`;
       }
       return null;
+    case "fxRates":
+      if (!isObject(payload) || !isObject(payload.rates)) return "payload has no rates";
+      for (const [code, rate] of Object.entries(payload.rates)) if (!isNum(rate) || (rate as number) < 0) return `rate for ${code} is not a non-negative number`;
+      return null;
     case "UserSettings":
       if (!isObject(payload)) return "payload is not an object";
       for (const f of ["preferZmBudgets", "sawMigrationAlert"] as const)

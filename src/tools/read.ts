@@ -69,8 +69,9 @@ export function registerReadTools(server: McpServer, ctx: Ctx) {
       const envs = view.envelopes();
       const metrics = view.graph.envMetrics(view.data)[month];
       const goals = view.graph.goals(view.data)[month] ?? {};
-      const visible = include_hidden ? undefined : view.visibleIds(month);
       const only = envelope ? view.resolveEnvelope(envelope) : undefined;
+      // A named envelope is shown even when Zerro would hide it.
+      const visible = include_hidden || only ? undefined : view.visibleIds(month);
       const structure = view.graph.envelopeStructure(view.data);
 
       const rows: unknown[] = [];

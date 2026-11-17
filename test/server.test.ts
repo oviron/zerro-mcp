@@ -1,7 +1,8 @@
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { UnknownOutcomeError, ZenMoneyClient, ZenMoneyError } from "../src/zenmoney/client";
 import { patchToWire, wireToPatch } from "../src/zenmoney/wire";
 import { BUDGET_DOC, connect, fixture, FakeZenMoney, NOW, ZERRO_ACCOUNT } from "./fake";
 
@@ -15,6 +16,26 @@ describe("wire", () => {
     expect(patch.budget[0]).toMatchObject({ id: "2026-11-01#food", changed: 5000 });
     expect(patch.deletion[0].stamp).toBe(7000);
     expect(patchToWire(patch)).toEqual(wire);
+  });
+});
+
+describe("ZenMoney client", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const answer = (status: number, text: () => Promise<string>) => vi.stubGlobal("fetch", async () => ({ status, text }));
+  const diff = () => new ZenMoneyClient("t", "https://api.zenmoney.ru", 1000).diff({ serverTimestamp: 0 });
+
+  it("does not take a malformed answer for a sync", async () => {
+    answer(200, async () => JSON.stringify({ serverTimestamp: 1, reminder: { a: {} } }));
+    await expect(diff()).rejects.toThrow(UnknownOutcomeError);
+    answer(200, async () => JSON.stringify({ serverTimestamp: 1, reminder: [{ id: "doc", changed: 1 }] }));
+    await expect(diff()).rejects.toThrow(/reminder row without comment/);
+    answer(200, async () => JSON.stringify(fixture()));
+    await expect(diff()).resolves.toHaveProperty("reminder");
+  });
+
+  it("keeps a 4xx a refusal even when its body is cut off", async () => {
+    answer(400, () => Promise.reject(new Error("reset")));
+    await expect(diff()).rejects.toThrow(ZenMoneyError);
   });
 });
 
@@ -56,6 +77,15 @@ describe("read tools", () => {
     const r = await call("get_envelopes", { month: "2031-01" });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/Available months/);
+  });
+
+  it("finds an envelope named like an object property and shows it even when empty", async () => {
+    const server = new FakeZenMoney();
+    server.write({ tag: [{ ...server.get("tag", "home")!, id: "odd", title: "constructor", showOutcome: false }] } as any);
+    const { call } = await connect({ server });
+    const r = await call("get_envelopes", { month: "2026-11", envelope: "constructor" });
+    expect(r.data!.envelopes.map((e: any) => e.id)).toEqual(["tag#odd"]);
+    expect((await call("get_envelope_activity", { envelope: "constructor", month: "2026-11" })).text).toMatch(/constructor \[tag#odd\]/);
   });
 
   it("asks for an id when a name is ambiguous", async () => {
@@ -196,11 +226,15 @@ describe("write tools", () => {
   it("refuses payloads Zerro would misread", async () => {
     const server = new FakeZenMoney();
     const doc = server.get("reminder", BUDGET_DOC)!;
-    server.write({ reminder: [{ ...doc, id: "settings", comment: JSON.stringify({ type: "UserSettings", payload: { preferZmBudgets: "false" } }) }] } as any);
+    server.write({ reminder: [
+      { ...doc, id: "settings", comment: JSON.stringify({ type: "UserSettings", payload: { preferZmBudgets: "false" } }) },
+      { ...doc, id: "rates", comment: JSON.stringify({ type: "fxRates", month: "2026-11", payload: { date: "2026-11", changed: 0, rates: { RUB: -1, USD: 90 } } }) },
+    ] } as any);
     const { call } = await connect({ write: true, server });
     const r = await call("set_envelope_budget", { envelope: "Home", amount: 600, month: "2026-11" });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/preferZmBudgets is not a boolean/);
+    expect(r.text).toMatch(/rate for RUB/);
   });
 
   it("changes the token when other budgets move, even if totals stay", async () => {

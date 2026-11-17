@@ -15,8 +15,6 @@ export function fmtFx(amount: TFxAmount): string {
   return parts.length ? parts.join(" + ") : "0";
 }
 
-const round2 = (n: number) => Math.round(n * 100) / 100;
-
 /**
  * Read helpers over one snapshot: month range, currency conversion as Zerro
  * does it (month rates), envelope lookup and the UI's visibility rule.
@@ -54,10 +52,9 @@ export class View {
     return month;
   }
 
-  /** Converts at the month's rates, as Zerro's budget screen does. */
+  /** Converts at the month's rates and rounds to money, as Zerro's budget screen does. */
   convert(amount: TFxAmount | undefined, currency: string, month: Month): number {
-    if (!amount) return 0;
-    return round2(this.convertFx(amount, currency, month));
+    return amount ? this.convertFx(amount, currency, month) : 0;
   }
 
   ratesSource(month: Month): string {
@@ -77,7 +74,7 @@ export class View {
   resolveEnvelope(query: string): TEnvelope {
     const all = this.envelopes();
     const q = query.trim();
-    if (all[q as TEnvelopeId]) return all[q as TEnvelopeId];
+    if (Object.hasOwn(all, q)) return all[q as TEnvelopeId];
     const norm = (s: string) => s.trim().toLowerCase();
     const exact = Object.values(all).filter(e => norm(e.name) === norm(q));
     if (exact.length === 1) return exact[0];

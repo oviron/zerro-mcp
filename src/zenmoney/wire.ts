@@ -32,6 +32,8 @@ const TIME_FIELDS: Record<string, string[]> = {
   deletion: ["stamp"],
 };
 
+export const WIRE_KEYS = Object.keys(TIME_FIELDS);
+
 export const budgetId = (date: string, tag: string | null) => `${date}#${tag}`;
 
 export function wireToPatch(diff: WireDiff): TNormalizedPatch {
